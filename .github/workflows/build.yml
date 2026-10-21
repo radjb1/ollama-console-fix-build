@@ -1,0 +1,66 @@
+name: Build Ollama 0.40.6 discovery console fix
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - name: Download verified tools and exact upstream source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest 'https://go.dev/dl/go1.26.10.windows-amd64.zip' -OutFile go.zip
+          if ((Get-FileHash go.zip -Algorithm SHA256).Hash.ToLower() -ne '7ecd2d7260e82c59bcbd7f1077a07cee2dea607295b858df67195a1e4e09629b') { throw 'Go checksum mismatch' }
+          Invoke-WebRequest 'https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-x86_64.zip' -OutFile compiler.zip
+          if ((Get-FileHash compiler.zip -Algorithm SHA256).Hash.ToLower() -ne '317492c456aa27ee607a5919f1d2d38dcdc1112516a24d0bf4b00d078f52d17a') { throw 'Compiler checksum mismatch' }
+          Expand-Archive go.zip -DestinationPath tools
+          Expand-Archive compiler.zip -DestinationPath tools
+          git clone --depth 1 --branch v0.40.6 https://github.com/ollama/ollama.git source
+          if ($LASTEXITCODE) { throw 'Source checkout failed' }
+          if ((git -C source rev-parse HEAD).Trim() -ne '2476d5ead197abe04629651028f83d48dc75d2b2') { throw 'Source revision mismatch' }
+      - name: Apply three launch-attribute additions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($entry in @(@('source/discover/llama_server.go', 'cmd'), @('source/discover/llama_server.go', 'cmd2'), @('source/discover/native_probe.go', 'cmd'))) {
+            $file = $entry[0]; $variable = $entry[1]
+            $text = [IO.File]::ReadAllText($file)
+            $pattern = '(?m)^(\t' + $variable + '\.WaitDelay = llamaServerDiscoveryWaitDelay\r?\n)'
+            if ([regex]::Matches($text, $pattern).Count -ne 1) { throw "Unexpected patch context: $file $variable" }
+            $replacement = '$1' + "`t$variable.SysProcAttr = llm.LlamaServerSysProcAttr`n"
+            [IO.File]::WriteAllText($file, [regex]::Replace($text, $pattern, $replacement), [Text.UTF8Encoding]::new($false))
+          }
+          git -C source diff --check
+          if ($LASTEXITCODE) { throw 'Source whitespace check failed' }
+          $changes = @(git -C source diff --numstat)
+          if ($changes.Count -ne 2 -or ($changes -join "`n") -notmatch '2\s+0\s+discover/llama_server.go' -or ($changes -join "`n") -notmatch '1\s+0\s+discover/native_probe.go') { throw 'Unexpected source changes' }
+          New-Item -ItemType Directory artifact | Out-Null
+          git -C source diff | Set-Content artifact/discovery-no-window.patch -Encoding utf8
+      - name: Test and build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH = "$pwd/tools/go/bin;$pwd/tools/llvm-mingw-20261006-ucrt-x86_64/bin;$env:PATH"
+          $env:CGO_ENABLED = '1'
+          $env:CC = 'x86_64-w64-mingw32-gcc'
+          $env:CXX = 'x86_64-w64-mingw32-g++'
+          $env:CGO_CFLAGS = '-O3'
+          $env:CGO_CXXFLAGS = '-O3'
+          Set-Location source
+          go test -short -timeout 180s ./discover
+          if ($LASTEXITCODE) { throw 'Discovery tests failed' }
+          go build -trimpath -ldflags '-s -w -X=github.com/ollama/ollama/version.Version=0.40.6-ghost-consolefix1 -X=github.com/ollama/ollama/server.mode=release' -o ../artifact/ollama.exe .
+          if ($LASTEXITCODE) { throw 'Build failed' }
+          go version -m ../artifact/ollama.exe | Set-Content ../artifact/build-info.txt
+          Get-FileHash ../artifact/ollama.exe -Algorithm SHA256 | Format-List | Out-File ../artifact/sha256.txt
+      - name: Upload candidate and build provenance
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ollama-0.40.6-ghost-consolefix1-windows-amd64
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
